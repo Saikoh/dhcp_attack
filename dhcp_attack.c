@@ -80,39 +80,6 @@ typedef struct {
 //#define BUFLEN 2000
 #define BUFLEN 1500
 
-typedef struct {
-        u_int8_t dst[6];
-        u_int8_t src[6];
-        u_int16_t type;
-} ether_hdr_t;
-
-typedef struct {
-        u_int8_t  fvhl;              /* header length, version */
-        u_int8_t  tos;               /* type of service */
-        int16_t   len;               /* total length */
-        u_int16_t id;                /* identification */
-        int16_t   off;               /* fragment offset field */
-#define IP_DF 0x4000                    /* dont fragment flag */
-#define IP_MF 0x2000                    /* more fragments flag */
-#define IP_OFFMASK 0x1fff               /* mask for fragmenting bits */
-        u_int8_t  ttl;               /* time to live */
-        u_int8_t  p;                 /* protocol */
-        u_int16_t sum;               /* checksum */
-        struct    in_addr src, dst; /* source and dest address */
-} ip_hdr_t;
-
-#define IP_V(iph)        ((iph)->fvhl >> 4)
-#define IP_HL(iph)       (((iph)->fvhl & 0x0F) << 2)
-#define IP_V_SET(iph,x)  ((iph)->fvhl = ((iph)->fvhl & 0x0F) | ((x) << 4))
-#define IP_HL_SET(iph,x) ((iph)->fvhl = ((iph)->fvhl & 0xF0) | (((x) >> 2) & 0x0F))
-
-typedef struct {
-        u_int16_t sport;             /* source port */
-        u_int16_t dport;             /* destination port */
-        u_int16_t ulen;              /* udp length */
-        u_int16_t sum;               /* udp checksum */
-} udp_hdr_t;
-
 #define DHCP_SNAME_LEN          64
 #define DHCP_FILE_LEN           128
 
@@ -133,14 +100,6 @@ typedef struct {
     char file[DHCP_FILE_LEN];      /* 104: Boot filename */
     unsigned char options[0];
 } dhcp_pkt_t;
-
-typedef struct {
-	u_int32_t xid;   /* DHCP Transaction ID */
-	u_int8_t mac[6]; /* MAC Address         */
-	u_int32_t sid;   /* Server ID 格納領域 */
-	struct in_addr client_addr; /* Client Address 格納領域 */
-	char agent_cid[32];
-} client_info_t;
 
 typedef struct {
 
@@ -174,16 +133,13 @@ typedef struct {
 manager g_mgr;
 
 #define E_THREAD_MAX    12  // 仮に 5とした
+#define E_MAX_SUBSC_CNT   10000
 typedef struct
 {
-	unsigned int  stag;
-	unsigned int  ctag;
-	u_int8_t  mac_addr[6]; // chaddr[]のベースの値
-	unsigned int  loop ;  // このスレッドが送信する Discoverの数
-	unsigned int  fst ;
-
-	sem_t sem;
-	void *client_db;
+	unsigned int  stag_base;   // 加入者番号
+	unsigned int  ctag_base;   // 端末番号
+	unsigned int  stag ;
+	unsigned int  ctag ;
 
 	int sock;
 
@@ -206,6 +162,10 @@ typedef struct
 	} counter;
 
 	u_int8_t  msgBuf[BUFLEN] ;
+
+	unsigned int  mapping[E_MAX_SUBSC_CNT][256]; // IP Address->xid Mapping
+    unsigned char sndId[E_MAX_SUBSC_CNT] ;
+    unsigned char rcvId[E_MAX_SUBSC_CNT] ;
 
 } thData __attribute__((__aligned__(CACHE_LINE_SIZE)));
 
@@ -352,41 +312,6 @@ show_manager_config()
 	printf("--core : %u\r\n", g_mgr.config.corebase);
 }
 
-/* Compute the easy part of the checksum on a range of bytes. */
-u_int32_t
-checksum(unsigned char *buf, unsigned nbytes, u_int32_t sum)
-{
-        unsigned i;
-
-        /* Checksum all the pairs of bytes first... */
-        for (i = 0; i < (nbytes & ~1U); i += 2) {
-                sum += (u_int16_t) ntohs(*((u_int16_t *)(buf + i)));
-                /* Add carry. */
-                if (sum > 0xFFFF)
-                        sum -= 0xFFFF;
-        }
-
-        /* If there's a single byte left over, checksum it, too.   Network
-           byte order is big-endian, so the remaining byte is the high byte. */
-        if (i < nbytes) {
-                sum += buf [i] << 8;
-                /* Add carry. */
-                if (sum > 0xFFFF)
-                        sum -= 0xFFFF;
-        }
-
-        return sum;
-}
-
-/* Finish computing the checksum, and then put it into network byte order. */
-u_int32_t
-wrapsum (u_int32_t sum)
-{
-        sum = ~sum & 0xFFFF;
-        return htons(sum);
-}
-
-
 int
 bind_sock(void)
 {
@@ -404,17 +329,17 @@ bind_sock(void)
 		close(sock);
 		return -1;
 	}
-
+	
 	if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (const char *)&sockbuf, sizeof(sockbuf)) != 0) {
 		close(sock);
 		return -1;
 	}
-
+	
 	if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (const char *)&sockbuf, sizeof(sockbuf)) != 0) {
 		close(sock);
 		return -1;
 	}
-
+	
 	sa.sin_family = AF_INET;
 	sa.sin_port = 0;
 	sa.sin_addr = g_mgr.config.src_addr;
@@ -554,6 +479,8 @@ static unsigned int  Nopt82ReqIdx ;
 static unsigned int  NmsgDcLen ;
 static unsigned int  NmsgReqLen ;
 
+static u_int8_t  NmsgDisc[BUFLEN] ;
+
 
 static inline int option_size(const struct dhcp_option_type* p_opt)
 {
@@ -650,7 +577,7 @@ int dhcpInitDiscover(struct dhcp_packet *a_packet)
 //  seqId format
 //    terminal No(0-199) : Upper 1 Byte
 //    subscId            : Lower 3 Byte
-int dhcpPerfDiscover(struct dhcp_packet *a_packet, unsigned int seqId,
+int dhcpPerfDiscover(struct dhcp_packet *a_packet, unsigned int xid, unsigned int ctag,
                      unsigned int subscId, struct in_addr *a_ciaddr)
 {
     DEBUG_PRINTF("==>> %s() Start", __func__) ;
@@ -661,13 +588,13 @@ int dhcpPerfDiscover(struct dhcp_packet *a_packet, unsigned int seqId,
     //a_packet->hops  = 1 ;  // クライアントが0を設定し、要求がルータを経由する度に値がインクリメントされる。
     //a_packet->secs  = 0 ;
 
-    a_packet->xid   = seqId;
+    a_packet->xid   = xid;
     a_packet->chaddr[0] = 0x00 ;
     a_packet->chaddr[1] = 0x4C ;
-    a_packet->chaddr[2] = seqId >> 24 ;
-    a_packet->chaddr[3] = seqId >> 16 ;
-    a_packet->chaddr[4] = seqId >>  8 ;
-    a_packet->chaddr[5] = seqId >>  0 ;
+    a_packet->chaddr[2] = ctag ;
+    a_packet->chaddr[3] = subscId >> 16 ;
+    a_packet->chaddr[4] = subscId >>  8 ;
+    a_packet->chaddr[5] = subscId >>  0 ;
 
     //a_packet->flags = htons (BOOTP_BROADCAST);
 
@@ -792,19 +719,14 @@ int dhcpInitRequest(struct dhcp_packet *a_packet)
 //  seqId format
 //    terminal No(0-199) : Upper 1 Byte
 //    subscId            : Lower 3 Byte
-int dhcpPerfRequest(struct dhcp_packet *a_packet, unsigned int seqId,
+int dhcpPerfRequest(struct dhcp_packet *a_packet, unsigned int xid, unsigned char *a_chaddr,
                      unsigned int subscId, struct in_addr *a_ciaddr,
                      struct in_addr *a_reqIP, struct dhcp_option_type *a_srvId)
 {
     DEBUG_PRINTF("==>> %s() Start", __func__) ;
 
-    a_packet->xid   = seqId;
-    a_packet->chaddr[0] = 0x00 ;
-    a_packet->chaddr[1] = 0x4C ;
-    a_packet->chaddr[2] = seqId >> 24 ;
-    a_packet->chaddr[3] = seqId >> 16 ;
-    a_packet->chaddr[4] = seqId >>  8 ;
-    a_packet->chaddr[5] = seqId >>  0 ;
+    a_packet->xid   = xid;
+    memcpy(a_packet->chaddr, a_chaddr, sizeof(a_packet->chaddr));
 
     //a_packet->flags = htons (BOOTP_BROADCAST);
 
@@ -858,12 +780,12 @@ volatile  static unsigned int  Counter = 0;
 void
 signal_handler(int signum)
 {
-	long int inverval;
+	long int intverval;
 	struct timeval now;
 	struct timeval now2;
 	unsigned long  per_discover=0, per_request=0, per_ack=0;
 	unsigned long  all_discover=0, all_request=0, all_ack=0, wait_offer=0, wait_ack=0;
-	unsigned int i ;
+	unsigned int i, j, k ;
 
 	gettimeofday(&now, NULL);
 	for (i=0; i<g_mgr.config.thCnt*2; i++)
@@ -878,10 +800,10 @@ signal_handler(int signum)
 		wait_ack     += g_thData[i].counter.all.waiting_ack.cnt  ;
 	}
 
-	inverval = (now.tv_sec - g_mgr.prev_time.tv_sec) * 1000 + (now.tv_usec - g_mgr.prev_time.tv_usec) / 1000;
+	intverval = (now.tv_sec - g_mgr.prev_time.tv_sec) * 1000 + (now.tv_usec - g_mgr.prev_time.tv_usec) / 1000;
 
-	printf("Interval %ld : Send Discover %lu/%lu, Request %lu/%lu, Received Ack %lu/%lu, Waiting Offer %lu, Ack %lu\r\n",
-	       inverval,
+	printf("Interval %ld : Send Discover %lu/%lu, Request %lu/%lu, Received Ack %lu/%lu, Waiting Offer %lu, Ack %lu\n",
+	       intverval,
 	       per_discover, all_discover,
 	       per_request, all_request,
 	       per_ack, all_ack,
@@ -892,16 +814,28 @@ signal_handler(int signum)
 	/* 終了判定 */
 	if (!g_mgr.finished.cnt && now.tv_sec - g_mgr.finished_time.tv_sec > 5) {
 
-		/* 全てのDiscoverを送信して5秒後に終了 */
+	    /* 全てのDiscoverを送信して5秒後に終了 */
+		unsigned int  errCnt = 0 ;
+
 		for (i=0; i<g_mgr.config.thCnt; i++)
 		{
-		    printf("id-%d : Send Discover %lu, Request %lu, Received Ack %lu, Waiting Offer %lu, Ack %lu\r\n",
+		    printf("id-%d : Send Discover %lu, Request %lu, Received Ack %lu, Waiting Offer %lu, Ack %lu\n",
 		       i,
 		       g_thData[i].counter.all.send_discover.cnt+ g_thData[g_mgr.config.thCnt+i].counter.all.send_discover.cnt,
 		       g_thData[i].counter.all.send_request.cnt + g_thData[g_mgr.config.thCnt+i].counter.all.send_request.cnt,
 		       g_thData[i].counter.all.received_ack.cnt + g_thData[g_mgr.config.thCnt+i].counter.all.received_ack.cnt,
-		       g_thData[i].counter.all.waiting_offer.cnt+ g_thData[g_mgr.config.thCnt+i].counter.all.waiting_offer.cnt,
+		       g_thData[i].counter.all.waiting_offer.cnt+ g_thData[g_mgr.config.thCnt+i].counter.all.waiting_offer.cnt, 
 		       g_thData[i].counter.all.waiting_ack.cnt  + g_thData[g_mgr.config.thCnt+i].counter.all.waiting_ack.cnt);
+
+		    for (j=0; j < E_MAX_SUBSC_CNT; ++j)
+		        for (k=0; k<256 & errCnt<50; ++k)
+		        {
+		            unsigned int data ;
+		            data = g_thData[i].mapping[j][k] ;
+
+		            if (data>>24 != ((data>>16)&0x000000ff))
+		                printf("#### [%03d] Unmatch subscid:%#x ipaddr:x.x.x.%d data:%#x\n", ++errCnt, g_thData[i].stag_base+i, k, data);
+		        }
 		}
 
 		exit(0);
@@ -949,6 +883,7 @@ recv_dhcp(thData  *a_thData, int flags)
 	u_int8_t buf[BUFLEN];
 	int  t_ret ;
 	int  i ;
+	unsigned int *a_mapping ;
 
 	do
 	{
@@ -958,7 +893,7 @@ recv_dhcp(thData  *a_thData, int flags)
 		{
 			break;
 		}
-
+		
 		if (t_len != len)
 		{
             if (0 == t_len)
@@ -983,6 +918,7 @@ recv_dhcp(thData  *a_thData, int flags)
 		}
 
 		//dhcp_show(dhcp, message_type[2]);
+		a_mapping = &a_thData->mapping[(dhcp->xid&0x00ffffff)-a_thData->stag_base][dhcp->yiaddr.s_addr>>24] ;
 
 		if (message_type[2] == 2) {
 			/* Recieved Offer */
@@ -991,7 +927,7 @@ recv_dhcp(thData  *a_thData, int flags)
 
 			server_id = serch_option(&dhcp->options[4], dhcp_option_len, 54);
 
-			dhcpPerfRequest((struct dhcp_packet *)a_thData->msgBuf, dhcp->xid, dhcp->xid&0x00FFFFFF, NULL, &dhcp->yiaddr, (struct dhcp_option_type *)server_id);
+			dhcpPerfRequest((struct dhcp_packet *)a_thData->msgBuf, dhcp->xid, dhcp->chaddr, dhcp->xid&0x00FFFFFF, NULL, &dhcp->yiaddr, (struct dhcp_option_type *)server_id);
 
 	        send_packet(a_thData->sock, a_thData->msgBuf, NmsgReqLen);
 
@@ -1000,14 +936,46 @@ recv_dhcp(thData  *a_thData, int flags)
 			rte_atomic32_inc(&a_thData->counter.all.send_request);
 			rte_atomic32_dec(&a_thData->counter.all.waiting_offer);
 			rte_atomic32_inc(&a_thData->counter.all.waiting_ack);
+
+			if ((*a_mapping & 0x000000FF)^dhcp->chaddr[2])
+            {
+                if (0 != ((*a_mapping)&0x0000FFFF))
+                {
+                    DbgError("#### DHCP_Offer Same IpAddr Assigned. xid=%#010x ctag=%#x yiaddr=%s cnt=%#010x\n",
+                             dhcp->xid, dhcp->chaddr[2], addr_str(dhcp->yiaddr), *a_mapping);
+                }
+            }
+
+            *a_mapping = (*a_mapping+0x00010000)&0x00FF0000 |
+                         (*a_mapping           )&0xFF00FFFF ;
 		}
 		else if (message_type[2] == 5) {
-			/* Received Ack★要排他★ */
+			/* Received Ack 要排他★ */
 			//client_delete(client, &a_thData->client_db, &a_thData->sem);
 			//free(client);
 			rte_atomic32_inc(&a_thData->counter.per_sec.received_ack);
 			rte_atomic32_inc(&a_thData->counter.all.received_ack);
 			rte_atomic32_dec(&a_thData->counter.all.waiting_ack);
+
+			if ((unsigned char)(a_thData->rcvId[(dhcp->xid&0x00ffffff)-a_thData->stag_base]+1) != (unsigned char)(dhcp->xid>>24))
+                DbgError("#### DHCP_ACK Unmatch SeqId. xid=%#010x expected Id=%#04x\n",
+                         dhcp->xid, a_thData->rcvId[(dhcp->xid&0x00ffffff)-a_thData->stag_base]+1);
+
+			a_thData->rcvId[(dhcp->xid&0x00ffffff)-a_thData->stag_base] = (dhcp->xid>>24);
+
+			if ((*a_mapping & 0x000000FF)^dhcp->chaddr[2])
+			{
+			    if (0 != ((*a_mapping)&0x0000FFFF))
+			    {
+		            DbgError("#### DHCP_ACK Same IpAddr Assigned. xid=%#010x ctag=%#x yiaddr=%s cnt=%#010x\n",
+		                     dhcp->xid, dhcp->chaddr[2], addr_str(dhcp->yiaddr), *a_mapping);
+			    }
+
+			    *a_mapping = dhcp->chaddr[2];
+			}
+
+			*a_mapping = (*a_mapping+0x01000000)&0xFF000000 |
+			             (*a_mapping           )&0x00FFFFFF ;
 		}
 		else {
 			DbgError("#### MessageType Error. xid=%#x type:%d \n", dhcp->xid, message_type[2]);
@@ -1017,80 +985,76 @@ recv_dhcp(thData  *a_thData, int flags)
 }
 
 #ifdef DPDK_USE
-int
+int 
 #else
 void *
 #endif
 start_client(void* arg)
 {
-	unsigned int stag ;
-	unsigned int ctag ;
-	int subscriver_count = 0;
-	unsigned int tmp = 100000;
+	int  i, j, loop=g_mgr.config.loop ;
+	volatile unsigned int tmp = 100000;
 	struct timespec  reqTime = {0, 0};
-
+	
 	sigset_t ss;
 	int t_ret, signo;
-
+	
 	sigemptyset(&ss);
 	t_ret = sigaddset(&ss, SIGALRM);
-    if (t_ret != 0)
+    if (t_ret != 0) 
         return 1;
     t_ret = sigprocmask(SIG_BLOCK, &ss, NULL);
-    if (t_ret != 0)
+    if (t_ret != 0) 
         return 1;
-
-#ifdef DPDK_USE
-    unsigned lcore_id;
-	lcore_id = rte_lcore_id();
-	printf("start_client from core %u\n", lcore_id);
-#endif
-
+	
 	thData  *a_thData = (thData*)arg;
-	stag = a_thData->stag ;
-	ctag = a_thData->ctag ;
-
-	srand(time(NULL));
-
+	
 	while(!g_mgr.start)
 		usleep(10);
 
-	printf("Start stag=%d, ctag=%d\r\n", stag,ctag);
-	while(a_thData->loop)
+
+	while(1)
 	{
-		//if (g_mgr.config.sleep+(tmp/10000) != 0)
-		{
-			reqTime.tv_nsec = g_mgr.config.sleep+tmp ;
+	    for (i=0; i<g_mgr.config.thCnt; i++)
+	    {
+#if 0
+            if (g_mgr.config.sleep+(tmp/10000) != 0)
+            {
+                reqTime.tv_nsec = g_mgr.config.sleep+tmp ;
 
-			nanosleep(&reqTime, NULL);
-			//usleep(g_mgr.config.sleep+(tmp/10000));
-			if (0 < tmp) --tmp;
-		}
+                nanosleep(&reqTime, NULL);
+                //usleep(g_mgr.config.sleep+(tmp/10000));
+                if (0 < tmp) --tmp;
+            }
+#else
+            for (j=0; j<g_mgr.config.sleep; ++j)
+                tmp += 1 ;
+#endif
 
-		dhcpPerfDiscover((struct dhcp_packet *)a_thData->msgBuf, (ctag<<24)+(stag+subscriver_count), stag+subscriver_count, NULL);
+            dhcpPerfDiscover((struct dhcp_packet *)NmsgDisc,
+                             ((++a_thData[i].sndId[a_thData[i].stag-a_thData[i].stag_base])<<24)+a_thData[i].stag,
+                             a_thData[i].ctag, a_thData[i].stag, NULL);
 
-		send_packet(a_thData->sock, a_thData->msgBuf, NmsgDcLen);
+            send_packet(a_thData[i].sock, NmsgDisc, NmsgDcLen);
 
-		/* 統計 */
-		rte_atomic32_inc(&a_thData->counter.per_sec.send_discover);
-		rte_atomic32_inc(&a_thData->counter.all.send_discover);
-		rte_atomic32_inc(&a_thData->counter.all.waiting_offer);
+            /* 統計 */
+            rte_atomic32_inc(&a_thData[i].counter.per_sec.send_discover);
+            rte_atomic32_inc(&a_thData[i].counter.all.send_discover);
+            rte_atomic32_inc(&a_thData[i].counter.all.waiting_offer);
 
-		--a_thData->loop;
+            if (0 >= --loop)
+                goto END ;
 
-		/* ctagを加算 */
-		subscriver_count++;
-		if (subscriver_count >= g_mgr.config.subscriber_count) {
-			subscriver_count = 0;
-			++ctag;
-			if (g_mgr.config.client_count <= ctag)
-			    ctag = a_thData->ctag;
-
-		}
-
-		//recv_dhcp(a_thData, MSG_DONTWAIT);
+            /* ctagを加算 */
+            a_thData[i].stag++;
+            if (a_thData[i].stag >= a_thData[i].stag_base+g_mgr.config.subscriber_count/g_mgr.config.thCnt) {
+                a_thData[i].stag = a_thData[i].stag_base;
+                ++a_thData[i].ctag;
+                if (a_thData[i].ctag_base+g_mgr.config.client_count <= a_thData[i].ctag)
+                    a_thData[i].ctag = a_thData[i].ctag_base;
+            }
+	    }
 	}
-
+END:
 	printf("Finished\r\n");
 
 	gettimeofday(&g_mgr.finished_time, NULL);
@@ -1106,7 +1070,7 @@ start_client(void* arg)
 }
 
 #ifdef DPDK_USE
-int
+int 
 #else
 void *
 #endif
@@ -1114,27 +1078,27 @@ recv_thread(void *arg)
 {
 	int  t_ret ;
 	thData  *a_thData = (thData*)arg;
-
-
+	
+	
 	sigset_t ss;
 	int  signo;
-
+	
 	sigemptyset(&ss);
 	t_ret = sigaddset(&ss, SIGALRM);
-    if (t_ret != 0)
+    if (t_ret != 0) 
         return 1;
     t_ret = sigprocmask(SIG_BLOCK, &ss, NULL);
-    if (t_ret != 0)
+    if (t_ret != 0) 
         return 1;
-
+	
 #ifdef DPDK_USE
 	unsigned lcore_id;
 	lcore_id = rte_lcore_id();
 	printf("recv_thread from core %u\n", lcore_id);
 #endif
-
+	
 	rte_atomic32_dec(&nb_thread_starting);
-
+	
 	while(g_mgr.status)
 	{
 		recv_dhcp(a_thData, 0);
@@ -1157,24 +1121,15 @@ start(void)
     g_mgr.status = 1;
 
 	rte_atomic32_set(&nb_thread_starting, 1);
-
+	
     printf("Rcv Thread working core(s): ");
-
+    
 	for (i=0; i<g_mgr.config.thCnt; i++)
 	{
 		memset(&g_thData[i], 0, sizeof(g_thData[i]));
 
-		sem_init(&g_thData[i].sem, 1, 1);
-		g_thData[i].stag = 200 + g_mgr.config.subscriber_count*i;
-		g_thData[i].ctag = 0 ;
-		g_thData[i].mac_addr[0] = 0x4c ;
-		g_thData[i].mac_addr[1] = (g_thData[i].stag>>24) & 0xFF;
-		g_thData[i].mac_addr[2] = (g_thData[i].stag>>16) & 0xFF;
-		g_thData[i].mac_addr[3] = (g_thData[i].stag>> 8) & 0xFF;
-		g_thData[i].mac_addr[4] = g_thData[i].stag       & 0xFF ;
-		//g_thData[i].mac_addr[5] = g_thData[i].ctag;
-
-		g_thData[i].loop = (g_mgr.config.loop+g_mgr.config.thCnt-1)/g_mgr.config.thCnt;
+		g_thData[i].stag = g_thData[i].stag_base = 200 + g_mgr.config.subscriber_count*i;
+		g_thData[i].ctag = g_thData[i].ctag_base = 0 ;
 
 		g_thData[i].sock = bind_sock() ;  // Thread毎に別々の Socketの方が速い...
 		if (0>g_thData[i].sock)
@@ -1182,11 +1137,11 @@ start(void)
 			printf("#### socket err...####\n");
 			exit(0);
 		}
-
+		
 		NmsgReqLen = dhcpInitRequest((struct dhcp_packet *)g_thData[i].msgBuf);
 
 		rte_atomic32_inc(&nb_thread_starting);
-
+		
 #ifdef DPDK_USE
 		for (lcore_id=rte_get_next_lcore(lcore_id,1,0);
 		     lcore_id<RTE_MAX_LCORE ;
@@ -1221,44 +1176,29 @@ start(void)
 	while(nb_thread_starting.cnt != 0){
 		usleep(1);
 	}
-
+	
     printf("Send Thread working core(s): ");
+    
+    NmsgDcLen = dhcpInitDiscover((struct dhcp_packet *)NmsgDisc);
 
-	for (; i<g_mgr.config.thCnt*2; i++)
-	{
-#ifdef DPDK_USE
-	    for (lcore_id=rte_get_next_lcore(lcore_id,1,0);
-		     lcore_id<RTE_MAX_LCORE ;
-		     lcore_id=rte_get_next_lcore(lcore_id,1,0))
-		{
-			rte_eal_remote_launch(start_client, (void*)&g_thData[i], lcore_id);
-			break ;
-		}
-#else
-	    g_thData[i] = g_thData[i%g_mgr.config.thCnt];
-
-	    NmsgDcLen = dhcpInitDiscover((struct dhcp_packet *)g_thData[i].msgBuf);
-
-	    if (0 != pthread_create(&thread, NULL, start_client, &g_thData[i]))
-        {
-            printf("#### start_client() create err...####\n");
-            exit(0);
-        }
-        CPU_ZERO( &cpuset );
-        CPU_SET ( g_mgr.config.corebase+i, &cpuset );
-        if (0 != pthread_setaffinity_np(thread, sizeof( cpuset ), &cpuset))
-        {
-            printf("pthread_setaffinity_np failed\n");
-            return -1;
-        }
-        else
-        {
-            printf("%d ", g_mgr.config.corebase+i);
-        }
-#endif
-        rte_atomic32_inc(&g_mgr.finished);
-	}
-
+    if (0 != pthread_create(&thread, NULL, start_client, g_thData))
+    {
+        printf("#### start_client() create err...####\n");
+        exit(0);
+    }
+    CPU_ZERO( &cpuset );
+    CPU_SET ( g_mgr.config.corebase+i, &cpuset );
+    if (0 != pthread_setaffinity_np(thread, sizeof( cpuset ), &cpuset))
+    {
+        printf("pthread_setaffinity_np failed\n");
+        return -1;
+    }
+    else
+    {
+        printf("%d ", g_mgr.config.corebase+i);
+    }
+    rte_atomic32_inc(&g_mgr.finished);
+	
     printf("thread:%d \n", i);
 	start_timer_handler();
 	g_mgr.start = 1;
@@ -1434,19 +1374,19 @@ main(int argc, char *argv[])
 		printf("interface name is required.\r\n");
 		exit(0);
 	}
-
+	
 #ifdef DPDK_USE
 	// CPU 12-23
 	int    rte_argc = 3;
 	char   *rte_argv[4];
-
+	
 	optind = 0;
-
+	
 	rte_argv[0] = "dhcp_attack";
 	rte_argv[1] = "-cFFF000"   ;
 	rte_argv[2] = "-n4"        ;
 	rte_argv[3] = NULL;
-
+	
 	if (rte_eal_init(rte_argc, rte_argv) <0)
 	{
 		DbgError("rte_eal_init() NG !!\n");
